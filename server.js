@@ -4,30 +4,61 @@ const mongoose = require('mongoose');
 const cors = require('cors');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
-const { Chess } = require('chess.js');
-
+const passport = require('passport');
+const session = require('express-session');
+const MongoStore = require('connect-mongo');
+const http = require('http');
 const SocketManager = require('./sockets/socketManager');
-// After creating http server
-
 
 const app = express();
+const server = http.createServer(app);
 
-// Security Middleware
-app.use(helmet());
+// Enhanced Security Middleware
+app.use(helmet({
+  contentSecurityPolicy: {
+    directives: {
+      defaultSrc: ["'self'"],
+      scriptSrc: ["'self'", "'unsafe-inline'", "cdn.jsdelivr.net"],
+      styleSrc: ["'self'", "'unsafe-inline'", "fonts.googleapis.com"],
+      imgSrc: ["'self'", "data:", "*.githubusercontent.com"],
+      connectSrc: ["'self'", process.env.FRONTEND_URL]
+    }
+  }
+}));
+
 app.use(cors({
-  origin: process.env.FRONTEND_URLS.split(',') || 'http://localhost:3000',
+  origin: process.env.FRONTEND_URL,
   credentials: true
 }));
-const socketManager = new SocketManager(server);
+
+app.use(express.json({ limit: '10kb' }));
+app.use(express.urlencoded({ extended: true, limit: '10kb' }));
+
+// Session Configuration
+app.use(session({
+  secret: process.env.SESSION_SECRET,
+  resave: false,
+  saveUninitialized: false,
+  store: MongoStore.create({
+    mongoUrl: process.env.MONGODB_URI,
+    ttl: 14 * 24 * 60 * 60 // 14 days
+  }),
+  cookie: {
+    secure: process.env.NODE_ENV === 'production',
+    httpOnly: true,
+    maxAge: 14 * 24 * 60 * 60 * 1000 // 14 days
+  }
+}));
 
 // Rate Limiting
 const limiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 100 // limit each IP to 100 requests per windowMs
+  windowMs: 15 * 60 * 1000,
+  max: 500,
+  message: 'Too many requests from this IP'
 });
-app.use(limiter);
+app.use('/api', limiter);
 
-// Database connection with retry logic
+// Database Connection with Retry
 const connectWithRetry = () => {
   mongoose.connect(process.env.MONGODB_URI, {
     useNewUrlParser: true,
@@ -35,34 +66,44 @@ const connectWithRetry = () => {
     retryWrites: true,
     w: 'majority'
   })
-  .then(() => console.log('MongoDB connected'))
+  .then(() => console.log('✅ MongoDB connected successfully'))
   .catch(err => {
-    console.error('MongoDB connection error:', err);
+    console.error('❌ MongoDB connection error:', err);
     setTimeout(connectWithRetry, 5000);
   });
 };
 connectWithRetry();
 
-// Socket.io integration
-const server = require('http').createServer(app);
-socketManager.initialize(server);
+// Initialize Socket.io
+new SocketManager(server);
 
 // Routes
 app.use('/api/v1/auth', require('./routes/auth'));
+app.use('/api/v1/users', require('./routes/users'));
 app.use('/api/v1/games', require('./routes/games'));
 app.use('/api/v1/puzzles', require('./routes/puzzles'));
+app.use('/api/v1/tournaments', require('./routes/tournaments'));
 app.use('/api/v1/training', require('./routes/training'));
 
-// Error handling
+// Health Check
+app.get('/health', (req, res) => {
+  res.status(200).json({
+    status: 'healthy',
+    database: mongoose.connection.readyState === 1 ? 'connected' : 'disconnected',
+    environment: process.env.NODE_ENV
+  });
+});
+
+// Error Handling
 app.use((err, req, res, next) => {
-  console.error(err.stack);
-  res.status(500).json({ 
-    success: false,
-    error: 'Internal Server Error' 
+  console.error('🔥 Error:', err.stack);
+  res.status(500).json({
+    status: 'error',
+    message: process.env.NODE_ENV === 'development' ? err.message : 'Something went wrong!'
   });
 });
 
 const PORT = process.env.PORT || 5000;
 server.listen(PORT, () => {
-  console.log(`Server running in ${process.env.NODE_ENV} mode on port ${PORT}`);
+  console.log(`🚀 Server running in ${process.env.NODE_ENV} mode on port ${PORT}`);
 });

@@ -1,74 +1,76 @@
-// sockets/socketManager.js
 const { Server } = require('socket.io');
 const Chess = require('chess.js');
+const jwt = require('jsonwebtoken');
 const Game = require('../models/Game');
 const User = require('../models/User');
-const Tournament = require('../models/Tournament');
 
 class SocketManager {
   constructor(server) {
     this.io = new Server(server, {
       cors: {
-        origin: process.env.FRONTEND_URLS.split(',') || 'http://localhost:3000',
+        origin: process.env.FRONTEND_URL,
         methods: ['GET', 'POST'],
         credentials: true
       },
       connectionStateRecovery: {
-        maxDisconnectionDuration: 2 * 60 * 1000, // 2 minutes
-        skipMiddlewares: true
+        maxDisconnectionDuration: 120000,
+        skipMiddlewares: false
       }
     });
 
-    this.activeGames = new Map(); // gameId -> { chess, players, spectators }
-    this.userSockets = new Map(); // userId -> socketId[]
+    this.activeGames = new Map();
+    this.userConnections = new Map();
 
-    this.setupEventHandlers();
-  }
-
-  setupEventHandlers() {
-    this.io.use(this.authenticate.bind(this));
-    this.io.on('connection', this.handleConnection.bind(this));
+    this.initializeSocketEvents();
   }
 
   async authenticate(socket, next) {
-    const token = socket.handshake.auth.token;
-    if (!token) return next(new Error('Authentication error'));
-
     try {
-      const user = await User.verifyToken(token);
+      const token = socket.handshake.auth.token;
+      if (!token) throw new Error('Authentication token missing');
+
+      const decoded = jwt.verify(token, process.env.JWT_SECRET);
+      const user = await User.findById(decoded.id).select('-password');
+
+      if (!user) throw new Error('User not found');
+      
       socket.user = user;
-      this.trackUserSocket(user._id, socket.id);
+      this.trackUserConnection(user._id.toString(), socket.id);
       next();
     } catch (err) {
-      next(new Error('Authentication failed'));
+      next(new Error(`Authentication failed: ${err.message}`));
     }
   }
 
-  trackUserSocket(userId, socketId) {
-    if (!this.userSockets.has(userId)) {
-      this.userSockets.set(userId, []);
+  trackUserConnection(userId, socketId) {
+    if (!this.userConnections.has(userId)) {
+      this.userConnections.set(userId, new Set());
     }
-    this.userSockets.get(userId).push(socketId);
+    this.userConnections.get(userId).add(socketId);
   }
 
-  async handleConnection(socket) {
-    console.log(`User connected: ${socket.user.name} (${socket.id})`);
+  initializeSocketEvents() {
+    this.io.use((socket, next) => this.authenticate(socket, next));
 
-    socket.on('joinGame', this.handleJoinGame.bind(this, socket));
-    socket.on('makeMove', this.handleMakeMove.bind(this, socket));
-    socket.on('offerDraw', this.handleOfferDraw.bind(this, socket));
-    socket.on('resign', this.handleResign.bind(this, socket));
-    socket.on('disconnect', this.handleDisconnect.bind(this, socket));
+    this.io.on('connection', (socket) => {
+      console.log(`⚡ New connection: ${socket.user.username} (${socket.id})`);
+
+      socket.on('joinGame', (gameId) => this.handleJoinGame(socket, gameId));
+      socket.on('makeMove', (data) => this.handleMakeMove(socket, data));
+      socket.on('offerDraw', (gameId) => this.handleDrawOffer(socket, gameId));
+      socket.on('resign', (gameId) => this.handleResignation(socket, gameId));
+      socket.on('disconnect', () => this.handleDisconnect(socket));
+    });
   }
 
   async handleJoinGame(socket, gameId) {
     try {
       const game = await Game.findById(gameId)
-        .populate('whitePlayer blackPlayer tournament');
+        .populate('whitePlayer blackPlayer', 'username rating avatar');
 
       if (!game) throw new Error('Game not found');
 
-      // Initialize game state if not already active
+      // Initialize game state if not active
       if (!this.activeGames.has(gameId)) {
         this.activeGames.set(gameId, {
           chess: new Chess(game.fen),
@@ -81,34 +83,28 @@ class SocketManager {
       const activeGame = this.activeGames.get(gameId);
 
       // Verify player authorization
-      if (![game.whitePlayer._id, game.blackPlayer._id].some(id => id.equals(socket.user._id))) {
-        if (!socket.user.isAdmin) {
-          activeGame.spectators.add(socket.id);
-        }
-      } else {
+      const isPlayer = [game.whitePlayer._id, game.blackPlayer._id]
+        .some(id => id.equals(socket.user._id));
+
+      if (isPlayer) {
         activeGame.players.add(socket.id);
+      } else {
+        activeGame.spectators.add(socket.id);
       }
 
       socket.join(gameId);
 
-      // Send full game state
-      socket.emit('gameState', {
-        fen: activeGame.chess.fen(),
-        pgn: activeGame.chess.pgn(),
-        turn: activeGame.chess.turn(),
-        players: {
-          white: game.whitePlayer,
-          black: game.blackPlayer
-        },
-        timeControl: game.timeControl,
-        status: game.status
-      });
+      // Send game state
+      socket.emit('gameState', this.getGameState(activeGame));
 
       // Notify others
-      socket.to(gameId).emit('playerJoined', {
-        userId: socket.user._id,
-        name: socket.user.name
-      });
+      if (isPlayer) {
+        socket.to(gameId).emit('playerActivity', {
+          type: 'join',
+          userId: socket.user._id,
+          username: socket.user.username
+        });
+      }
 
     } catch (err) {
       socket.emit('error', err.message);
@@ -116,41 +112,54 @@ class SocketManager {
     }
   }
 
+  getGameState(game) {
+    return {
+      fen: game.chess.fen(),
+      pgn: game.chess.pgn(),
+      turn: game.chess.turn(),
+      players: {
+        white: game.gameData.whitePlayer,
+        black: game.gameData.blackPlayer
+      },
+      status: game.gameData.status,
+      lastMove: game.chess.history({ verbose: true }).slice(-1)[0]
+    };
+  }
+
   async handleMakeMove(socket, { gameId, move }) {
     try {
       const activeGame = this.activeGames.get(gameId);
       if (!activeGame) throw new Error('Game not active');
 
-      // Validate player turn
       const chess = activeGame.chess;
-      if ((chess.turn() === 'w' && !activeGame.gameData.whitePlayer._id.equals(socket.user._id)) ||
-          (chess.turn() === 'b' && !activeGame.gameData.blackPlayer._id.equals(socket.user._id))) {
+      const gameData = activeGame.gameData;
+
+      // Validate player turn
+      const isWhite = gameData.whitePlayer._id.equals(socket.user._id);
+      const isBlack = gameData.blackPlayer._id.equals(socket.user._id);
+      
+      if ((chess.turn() === 'w' && !isWhite) || (chess.turn() === 'b' && !isBlack)) {
         throw new Error('Not your turn');
       }
 
       // Make the move
-      const result = chess.move(move);
-      if (!result) throw new Error('Invalid move');
+      const moveResult = chess.move(move);
+      if (!moveResult) throw new Error('Invalid move');
+
+      // Update game data
+      gameData.fen = chess.fen();
+      gameData.pgn = chess.pgn();
 
       // Broadcast new state
-      this.io.to(gameId).emit('gameState', {
-        fen: chess.fen(),
-        pgn: chess.pgn(),
-        turn: chess.turn()
-      });
+      this.io.to(gameId).emit('gameState', this.getGameState(activeGame));
 
       // Check for game end
       if (chess.isGameOver()) {
-        await this.handleGameEnd(gameId, chess);
+        await this.handleGameEnd(activeGame);
       }
 
-      // Auto-save every 5 moves
-      if (chess.history().length % 5 === 0) {
-        await Game.findByIdAndUpdate(gameId, {
-          fen: chess.fen(),
-          pgn: chess.pgn()
-        });
-      }
+      // Save game progress
+      await gameData.save();
 
     } catch (err) {
       socket.emit('moveError', err.message);
@@ -158,40 +167,43 @@ class SocketManager {
     }
   }
 
-  async handleGameEnd(gameId, chess) {
-    const activeGame = this.activeGames.get(gameId);
-    const result = {
-      status: 'finished',
-      fen: chess.fen(),
-      pgn: chess.pgn()
-    };
+  async handleGameEnd(game) {
+    const chess = game.chess;
+    const gameData = game.gameData;
 
     if (chess.isCheckmate()) {
-      result.winner = chess.turn() === 'w' ? 'black' : 'white';
+      gameData.winner = chess.turn() === 'w' ? gameData.blackPlayer : gameData.whitePlayer;
+      gameData.result = chess.turn() === 'w' ? '0-1' : '1-0';
     } else if (chess.isDraw()) {
-      result.result = 'draw';
+      gameData.result = '½-½';
     }
 
-    // Update database
-    await Game.findByIdAndUpdate(gameId, result);
+    gameData.status = 'finished';
+    gameData.endedAt = new Date();
 
-    // Notify players
-    this.io.to(gameId).emit('gameEnded', result);
+    // Save final game state
+    await gameData.save();
+
+    // Broadcast game end
+    this.io.to(gameData._id.toString()).emit('gameEnded', {
+      result: gameData.result,
+      winner: gameData.winner,
+      pgn: gameData.pgn
+    });
 
     // Cleanup
-    this.activeGames.delete(gameId);
+    this.activeGames.delete(gameData._id.toString());
   }
 
   handleDisconnect(socket) {
-    console.log(`User disconnected: ${socket.user.name} (${socket.id})`);
+    console.log(`💤 Disconnected: ${socket.user.username} (${socket.id})`);
 
     // Remove from user tracking
-    const userSockets = this.userSockets.get(socket.user._id);
+    const userSockets = this.userConnections.get(socket.user._id.toString());
     if (userSockets) {
-      const index = userSockets.indexOf(socket.id);
-      if (index !== -1) userSockets.splice(index, 1);
-      if (userSockets.length === 0) {
-        this.userSockets.delete(socket.user._id);
+      userSockets.delete(socket.id);
+      if (userSockets.size === 0) {
+        this.userConnections.delete(socket.user._id.toString());
       }
     }
 
@@ -199,14 +211,11 @@ class SocketManager {
     this.activeGames.forEach((game, gameId) => {
       if (game.players.has(socket.id)) {
         game.players.delete(socket.id);
-        this.io.to(gameId).emit('playerDisconnected', {
+        this.io.to(gameId).emit('playerActivity', {
+          type: 'disconnect',
           userId: socket.user._id,
-          name: socket.user.name
+          username: socket.user.username
         });
-
-        if (game.players.size === 0) {
-          this.activeGames.delete(gameId);
-        }
       }
     });
   }
