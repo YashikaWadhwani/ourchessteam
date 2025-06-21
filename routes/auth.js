@@ -1,25 +1,34 @@
 const express = require('express');
+const passport = require('passport');
 const router = express.Router();
-const bcrypt = require('bcryptjs');
-const jwt = require('jsonwebtoken'); // ONLY ONE TIME
 const User = require('../models/User');
 
-// Register endpoint
 router.post('/register', async (req, res) => {
   try {
-    // ... registration logic
+    const { name, email, password } = req.body;
+    const user = new User({ name, email, password });
+    await user.save();
+    req.login(user, err => {
+      if (err) return res.status(500).json({ message: 'Login after register failed' });
+      return res.json(user);
+    });
   } catch (err) {
-    res.status(400).json({ error: err.message });
+    res.status(400).json({ message: err.message });
   }
 });
 
-// Login endpoint
-router.post('/login', async (req, res) => {
-  try {
-    // ... login logic
-  } catch (err) {
-    res.status(400).json({ error: err.message });
-  }
+router.post('/login', passport.authenticate('local'), (req, res) => {
+  res.json(req.user);
+});
+
+router.get('/logout', (req, res) => {
+  req.logout();
+  res.json({ message: 'Logged out' });
+});
+
+router.get('/user', (req, res) => {
+  if (!req.user) return res.status(401).json({ message: 'Not authenticated' });
+  res.json(req.user);
 });
 
 module.exports = router;

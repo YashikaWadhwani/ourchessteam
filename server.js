@@ -1,68 +1,85 @@
 require('dotenv').config();
 const express = require('express');
 const mongoose = require('mongoose');
-const http = require('http');
-const socketIo = require('socket.io');
-const path = require('path');
 const cors = require('cors');
+const session = require('express-session');
+const passport = require('passport');
+const LocalStrategy = require('passport-local').Strategy;
+const bcrypt = require('bcryptjs');
 const User = require('./models/User');
+const ChessGame = require('./models/ChessGame');
 const Puzzle = require('./models/Puzzle');
 const Tournament = require('./models/Tournament');
 
 const app = express();
-const server = http.createServer(app);
-const io = socketIo(server, {
-  cors: {
-  origin: process.env.FRONTEND_URL || "http://localhost:5173",
-  credentials: true
-}
-});
+
+// Database connection
+mongoose.connect(process.env.MONGODB_URI, {
+  useNewUrlParser: true,
+  useUnifiedTopology: true
+})
+.then(() => console.log('MongoDB connected'))
+.catch(err => console.log(err));
 
 // Middleware
-app.use(cors());
+app.use(cors({
+  origin: process.env.CLIENT_URL || 'http://localhost:3000',
+  credentials: true
+}));
 app.use(express.json());
-//app.use(express.static(path.join(__dirname, '../client/dist')));
-app.use(express.static(path.join(__dirname, 'client', 'dist')));
-// Database Connection
-mongoose.connect(process.env.MONGODB_URI)
+app.use(express.urlencoded({ extended: true }));
+app.use(session({
+  secret: process.env.SESSION_SECRET,
+  resave: false,
+  saveUninitialized: false,
+  cookie: { secure: process.env.NODE_ENV === 'production' }
+}));
+app.use(passport.initialize());
+app.use(passport.session());
 
-  .then(() => console.log('Connected to MongoDB'))
-  .catch(err => console.error('MongoDB connection error:', err));
-mongoose.connection.on('error', err => {
-  console.error('MongoDB connection error:', err);
+// Passport configuration
+passport.use(new LocalStrategy({
+  usernameField: 'email'
+}, async (email, password, done) => {
+  try {
+    const user = await User.findOne({ email });
+    if (!user) return done(null, false, { message: 'Incorrect email.' });
+    
+    const isMatch = await bcrypt.compare(password, user.password);
+    if (!isMatch) return done(null, false, { message: 'Incorrect password.' });
+    
+    return done(null, user);
+  } catch (err) {
+    return done(err);
+  }
+}));
+
+passport.serializeUser((user, done) => done(null, user.id));
+passport.deserializeUser(async (id, done) => {
+  try {
+    const user = await User.findById(id);
+    done(null, user);
+  } catch (err) {
+    done(err);
+  }
 });
 
-// Socket.io for real-time chess
-io.on('connection', (socket) => {
-  console.log('New client connected:', socket.id);
+// Routes
+const authRoutes = require('./routes/auth');
+const gameRoutes = require('./routes/games');
+const puzzleRoutes = require('./routes/puzzles');
+const tournamentRoutes = require('./routes/tournaments');
 
-  socket.on('joinGame', (gameId) => {
-    socket.join(gameId);
-    console.log(`Player joined game: ${gameId}`);
-  });
+app.use('/api/auth', authRoutes);
+app.use('/api/games', gameRoutes);
+app.use('/api/puzzles', puzzleRoutes);
+app.use('/api/tournaments', tournamentRoutes);
 
-  socket.on('makeMove', ({ gameId, move }) => {
-    io.to(gameId).emit('moveMade', move);
-  });
-
-  socket.on('disconnect', () => {
-    console.log('Client disconnected:', socket.id);
-  });
+// Error handling
+app.use((err, req, res, next) => {
+  console.error(err.stack);
+  res.status(500).json({ message: 'Something went wrong!' });
 });
 
-// API Routes
-app.use('/api/auth', require('./routes/auth'));
-app.use('/api/users', require('./routes/users'));
-app.use('/api/games', require('./routes/games'));
-app.use('/api/puzzles', require('./routes/puzzles'));
-app.use('/api/tournaments', require('./routes/tournaments'));
-
-// All other routes go to React
-app.get('*', (req, res) => {
-  res.sendFile(path.join(__dirname, '../client/dist/index.html'));
-});
-
-const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-});
+const PORT = process.env.PORT || 5000;
+app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
