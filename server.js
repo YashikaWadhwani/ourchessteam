@@ -2,79 +2,67 @@ require('dotenv').config();
 const express = require('express');
 const mongoose = require('mongoose');
 const cors = require('cors');
-const session = require('express-session');
-const passport = require('passport');
-const { Server } = require('socket.io');
-const http = require('http');
-const Chess = require('chess.js');
+const helmet = require('helmet');
+const rateLimit = require('express-rate-limit');
+const { Chess } = require('chess.js');
+
+const SocketManager = require('./sockets/socketManager');
+// After creating http server
+
 
 const app = express();
-const server = http.createServer(app);
-const io = new Server(server, {
-  cors: {
-    origin: process.env.CLIENT_URL || "http://localhost:3000",
-    methods: ["GET", "POST"]
-  }
-});
 
-// Database connection
-mongoose.connect(process.env.MONGODB_URI || 'mongodb://localhost:27017/ourchessteam')
-  .then(() => console.log('MongoDB connected'))
-  .catch(err => console.log(err));
-
-// Middleware
+// Security Middleware
+app.use(helmet());
 app.use(cors({
-  origin: process.env.CLIENT_URL || 'http://localhost:3000',
+  origin: process.env.FRONTEND_URLS.split(',') || 'http://localhost:3000',
   credentials: true
 }));
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
-app.use(session({
-  secret: process.env.SESSION_SECRET || 'your-secret-key',
-  resave: false,
-  saveUninitialized: false
-}));
-app.use(passport.initialize());
-app.use(passport.session());
+const socketManager = new SocketManager(server);
 
-// Socket.io for real-time chess
-const activeGames = new Map();
+// Rate Limiting
+const limiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 100 // limit each IP to 100 requests per windowMs
+});
+app.use(limiter);
 
-io.on('connection', (socket) => {
-  console.log('New client connected:', socket.id);
-
-  socket.on('joinGame', (gameId) => {
-    socket.join(gameId);
-    if (!activeGames.has(gameId)) {
-      activeGames.set(gameId, new Chess());
-    }
-    socket.emit('gameState', activeGames.get(gameId).fen());
+// Database connection with retry logic
+const connectWithRetry = () => {
+  mongoose.connect(process.env.MONGODB_URI, {
+    useNewUrlParser: true,
+    useUnifiedTopology: true,
+    retryWrites: true,
+    w: 'majority'
+  })
+  .then(() => console.log('MongoDB connected'))
+  .catch(err => {
+    console.error('MongoDB connection error:', err);
+    setTimeout(connectWithRetry, 5000);
   });
+};
+connectWithRetry();
 
-  socket.on('makeMove', ({ gameId, move }) => {
-    const game = activeGames.get(gameId);
-    try {
-      game.move(move);
-      io.to(gameId).emit('gameState', game.fen());
-    } catch (err) {
-      socket.emit('moveError', err.message);
-    }
-  });
+// Socket.io integration
+const server = require('http').createServer(app);
+socketManager.initialize(server);
 
-  socket.on('disconnect', () => {
-    console.log('Client disconnected:', socket.id);
+// Routes
+app.use('/api/v1/auth', require('./routes/auth'));
+app.use('/api/v1/games', require('./routes/games'));
+app.use('/api/v1/puzzles', require('./routes/puzzles'));
+app.use('/api/v1/training', require('./routes/training'));
+
+// Error handling
+app.use((err, req, res, next) => {
+  console.error(err.stack);
+  res.status(500).json({ 
+    success: false,
+    error: 'Internal Server Error' 
   });
 });
 
-// Routes
-app.use('/api/auth', require('./routes/auth'));
-app.use('/api/games', require('./routes/games'));
-app.use('/api/puzzles', require('./routes/puzzles'));
-app.use('/api/tournaments', require('./routes/tournaments'));
-app.use('/api/training', require('./routes/training'));
-
-// Start server
 const PORT = process.env.PORT || 5000;
 server.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
+  console.log(`Server running in ${process.env.NODE_ENV} mode on port ${PORT}`);
 });

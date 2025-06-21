@@ -19,3 +19,8 @@ UserSchema.pre('save', async function(next) {
 });
 
 module.exports = mongoose.model('User', UserSchema);
+
+UserSchema.statics.verifyToken = function(token) {
+  const decoded = jwt.verify(token, process.env.JWT_SECRET);
+  return this.findById(decoded.id);
+};
