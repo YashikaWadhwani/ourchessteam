@@ -25,8 +25,12 @@ app.use(express.json());
 app.use(express.static(path.join(__dirname, 'client', 'dist')));
 // Database Connection
 mongoose.connect(process.env.MONGODB_URI)
+
   .then(() => console.log('Connected to MongoDB'))
   .catch(err => console.error('MongoDB connection error:', err));
+mongoose.connection.on('error', err => {
+  console.error('MongoDB connection error:', err);
+});
 
 // Socket.io for real-time chess
 io.on('connection', (socket) => {
